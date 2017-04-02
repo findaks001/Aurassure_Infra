@@ -6,7 +6,6 @@
 #define DHTTYPE DHT22           // DHT 22  (AM2302), AM2321
 #define DHTPIN A3
 
-
 #define ss Serial
 
 #include <TinyGPS.h>
@@ -14,6 +13,8 @@ TinyGPS gps;
 
 #define alphasense 0x48
 #define otherSensor 0x49
+#define MAX_BATTERY_VOLTAGE 8.4
+#define MAX_BATTERY_VOLTAGE_LIMIT 6.4
 
 const byte channels[8] = {0x8C,0xCC,0x9C,0xDC,0xAC,0xEC,0xBC,0xFC};
 
@@ -56,15 +57,18 @@ unsigned char buf[LENG]; //receive data from the air detector module
 
 DHT dht(DHTPIN, DHTTYPE);
 
-#define TRANSMISSION_INTERVAL 1*60
 #define DELAY_INTERVAL 0 * 60   // 15 is number of minutes, 60 is multiplied to convert the minutes to second
 unsigned long g_time = 0;    //  This number will overflow (go back to zero), after approximately 38 days.
 
-#define SerialNeeded 1
+#define SerialNeeded 0
+#define batteryPin A1
+#define fanPin 9
+#define GPRSSleep 25
+#define GPSEnable 27
 
 float h, t , co2, co, so2, no2, o3, noise;
 float flat, flon;
-int n;
+int n, transmissionInterval = 0;
 
 // Look up table for n from -30 to 50 for A4 type sensors
 const PROGMEM float look_up_o3[] = {0.18, 0.18, 0.18, 0.18, 0.18, 0.18, 0.18, 0.18, 2.87};
@@ -82,8 +86,10 @@ void setup() {
   Serial1.setTimeout(1500);    //set the Timeout to 1500ms, longer than the data transmission periodic time of the sensor
   Wire.begin();             // join i2c bus (address optional for master) 
   delay(1000);
-  pinMode(9,OUTPUT);
-  digitalWrite(9, HIGH);
+  
+  pinMode(fanPin,OUTPUT);
+  digitalWrite(fanPin, HIGH);
+  
   dht.begin();
   ISASerial.begin(9600);
   gsmSerial.begin(9600);
@@ -97,22 +103,92 @@ void setup() {
 }
 
 void loop() {
-  analogWrite(9,150);
-  float battery_voltage = (analogRead(A1)*8.4/1023.0);
-  Serial.print("Battery Voltage is:");
-  Serial.println(battery_voltage);
+
+  int mode = getPowerMode();
+  setPowerMode(mode);
+  
   readSensors();
-  delay(4000);
+  delay(1000);
   data = stringFormation(); 
 
  // config_packet_aurassure(id, auth_key, interval, data);
   delay(1000);
   
-  if (check_gprs_transmission_period()) {
+  Serial.print("GPRS Data Sending");
+  networkErrorHandling();
+  transmit_gprs_data();
+}
 
-    networkErrorHandling();
-    transmit_gprs_data();
+int getPowerMode()
+{
+  float powerPercentage = ((readBatteryVoltage()- MAX_BATTERY_VOLTAGE_LIMIT)/(MAX_BATTERY_VOLTAGE - MAX_BATTERY_VOLTAGE_LIMIT))*100.0;
+  int mode;
+  if (powerPercentage >= 50)
+    mode = 0;
+  else if ((powerPercentage < 50)&&(powerPercentage > 20))
+    mode = 1;
+  else 
+    mode = 2;
+
+  return mode;
+}
+
+void setPowerMode(int mode)
+{
+  switch(mode)
+  {
+    //Power On or Directly Powered by Solar or Battery Voltage above
+    case 0:
+    {
+      Serial.println("Normal Mode"); 
+      transmissionInterval = 0 * 60;
+      while(!check_gprs_transmission_period());
+      break; 
+    }
+    // Power Saver Mode
+    case 1:
+    {
+      Serial.println("Power Saver Mode");
+      transmissionInterval = 15 * 60;
+      while(!check_gprs_transmission_period())
+      {
+        // Put everything to sleep
+        digitalWrite(GPRSSleep,HIGH);
+        digitalWrite(GPSEnable,HIGH);
+        fanSpeed(0); 
+      }
+      // re-start everything 
+      digitalWrite(GPRSSleep,LOW);
+      digitalWrite(GPSEnable,LOW);
+      fanSpeed(60); 
+      break; 
+    }
+    // Powerdown Mode
+    case 2:
+    {
+      Serial.println("Power Down Mode");
+      while(getPowerMode() == 2)
+      {
+        // Put everything to sleep
+        digitalWrite(GPRSSleep,HIGH);
+        digitalWrite(GPSEnable,HIGH);
+        fanSpeed(0);
+      }
+      // re-start everything 
+      digitalWrite(GPRSSleep,LOW);
+      digitalWrite(GPSEnable,LOW);
+      fanSpeed(60); 
+      break; 
+    }
+    default:
+      break;
   }
+}
+
+void fanSpeed(int percentage)
+{
+  int pwmValue = 255 * (percentage/100.0);
+  analogWrite(fanPin,pwmValue);
 }
 
 void readSensors()
@@ -160,8 +236,6 @@ void transmit_gprs_data() {
   int connectionNo = 0;
   String gprs_packet_data = "";
 
-
-
   //http://api.aurassure.com/device/v1/log?i=c52841sr&e={"a":"abf1ea25","n":0,"da":[{"d":"04-02-2017","t":"20:09:18","p":["0","0","nan","nan","0.00","0.00","10.0","1.0","0.4","0"]}]}
    data = stringFormation();
    String id = "CSwBbeYZ";
@@ -177,6 +251,16 @@ void transmit_gprs_data() {
   ConnectionStatus = disconnected;
   gprs_send(packet, connectionNo, ConnectionStatus, protocol, Ip, Port, URL);
 
+}
+
+float readBatteryVoltage(){
+  float batteryVoltage = (analogRead(batteryPin)*(10.0/1023.0));
+#if SerialNeeded
+  Serial.print("Battery Voltage is:");
+  Serial.println(batteryVoltage);
+#endif
+
+ return batteryVoltage;
 }
 
 void readTemperatureHumidity() {
@@ -434,7 +518,7 @@ void readnoise() {
 bool check_gprs_transmission_period() {
 
   // check if the time interval has reached then start transmission
-  if (TRANSMISSION_INTERVAL < (millis() - g_time) / 1000) {
+  if (transmissionInterval < (millis() - g_time) / 1000) {
     g_time = millis();               // Store the Time for next check
     return  true;
   }
